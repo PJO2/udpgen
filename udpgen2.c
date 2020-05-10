@@ -56,9 +56,14 @@ exit(0);
 } // SYNTAX
 
 
+// Log levels
 enum LogLevels { EMERG, ALERT, CRIT, ERR, WARN, NOTICE, INFO, DEBUG, TRACE };
 
 #define DEFAULT_DURATION 10
+
+// recalibrate delay each 50 packets
+#define CALIBRATE_FREQ 50
+
 
 // ----------------------------------------------
 // CLI parsing informations
@@ -96,17 +101,17 @@ sSettings = { 10, DEFAULT_DURATION, 1, 1024, "54321", NULL, ERR };
 struct S_Host
 {
    struct S_Host  *next;
-   const char     *name;
-   const char     *dst_port;
+   const char     *name;		// destination
+   const char     *dst_port;	
    // socket info
    int             skt;
-   struct sockaddr_storage sa;
-   int             sa_len;
-   char           *buf;
-   int             buflen;
-   struct timeval  tv;
-
-   long            count;
+   struct sockaddr_storage sa;	// sockaddr
+   int             sa_len;		// sockaddr_len
+   char           *buf;			// frame to send
+   int             buflen;		// frame size
+   time_t          us_between_packets;		// delay	
+   
+   size_t          count;		// # packet to send
    // system info
    pthread_t       thread_id;
 }; // S_Host
@@ -128,12 +133,34 @@ va_list args;
     }
 } // LOG
 
+
 // --------------------------------------------------------
-// worker thread
+// microseconds since program start
 // --------------------------------------------------------
 
+time_t _microseconds ()
+{
+static time_t start_time=0; 
+struct timeval now;    
+
+    gettimeofday (& now, NULL) ; 
+    if (start_time == 0)  //
+    {
+		start_time = now.tv_sec * 1000000 + now.tv_usec;
+		return 0 ;
+    }
+return now.tv_sec * 1000000 + now.tv_usec - start_time;
+} // _microseconds
+
+
+// --------------------------------------------------------
+// network functions
+// --------------------------------------------------------
+
+// --------
 // create udp skt and "connect" it 
 // in fact, manly resolve the host name
+// --------
 int socket_init (struct S_Host *pHost)
 {
 struct addrinfo hints, *res;
@@ -163,17 +190,14 @@ int rc;
 
   memcpy (& pHost->sa, res->ai_addr, res->ai_addrlen);
   pHost->sa_len = res->ai_addrlen;
-
   freeaddrinfo(res);
 
 
   rc = connect (pHost->skt, (struct sockaddr *) & pHost->sa, pHost->sa_len);
   if (rc<0) 
-    printf ("connect error for host %s\n", pHost->name);
-
-  if (sSettings.verbose) 
-      LOG (NOTICE,  "socket %d created for host %s on port %s, %d packets to send\n", 
-              pHost->skt, pHost->name, pHost->dst_port, pHost->count);
+     LOG (ERR, "connect error for host %s\n", pHost->name);
+  LOG (NOTICE, "socket %d created for host %s on port %s, %d packets to send\n", 
+               pHost->skt, pHost->name, pHost->dst_port, pHost->count);
 
   // allocate space for datagram
   pHost->buf = malloc (sSettings.pkt_length);
@@ -182,60 +206,65 @@ return rc;
 } // socket_init
 
 
-// -------------
+// -----------
 // the sender thread 
-// -------------
-#define RATE_MON 50
+// -----------
 void *UdpBulkSend (void *pVoid)
 {
 struct S_Host *pHost = (struct S_Host *) pVoid;
-struct timeval tv, before, after, before100, after100, reference;
+time_t         us_op_delay, before_send, before_calibration=0 ; 
+struct timeval tv;
+           
          
-   gettimeofday (& after, NULL) ;
-   gettimeofday (& after100, NULL);
-
-   reference = pHost->tv;
-   for ( ; pHost->count > 0 ;  )
+   // us_delay may can
+   us_op_delay = pHost->us_between_packets;  // keep us_between_packets as reference
+   
+   for ( ; pHost->count > 0 ;  pHost->count-- )
    { 
-  	    gettimeofday (& before, NULL) ; 
-		send (  pHost->skt,
-						 pHost->buf,
-						 pHost->buflen,
-						 0 );
-         // do not process error, since we want send packets
-         // regardless if the sender is listening or not 
-
-         LOG (TRACE, "packet #%d sent to %s\n", pHost->count, pHost->name);
-         pHost->count--;
-	     
-         tv = reference;
-
-	     gettimeofday (& after, NULL) ;
-		 if (after.tv_usec > before.tv_usec)
-				 tv.tv_usec = reference.tv_usec - (after.tv_usec - before.tv_usec);
-		 if (tv.tv_usec>0) 
-				select ( 0, NULL, NULL, NULL, & tv );
+	    before_send = _microseconds ();
+	    // send the packet do not retrieve error code
+		send (  pHost->skt, pHost->buf, pHost->buflen, 0 );
+        LOG (TRACE, "packet #%d sent to %s\n", pHost->count, pHost->name);
+        
+		// wait estimated delay
+		tv.tv_sec = 0;
+		tv.tv_usec = us_op_delay - (_microseconds () - before_send); 
+		select (1, NULL, NULL, NULL, & tv);
 		
-		 if (pHost->count % RATE_MON == 0)
-		 {long tm; int retard;
-		     gettimeofday (& before100, NULL);
-		     tm =  (before100.tv_sec - after100.tv_sec) * 1000000 + before100.tv_usec - after100.tv_usec ;
-		     retard = (tm - pHost->tv.tv_usec * RATE_MON) * RATE_MON / tm;
- //if (retard<0) printf ("tm %ld, %ld, retard %d packets\n", tm, (long) pHost->tv.tv_usec * RATE_MON, retard);
- if (retard >  RATE_MON/4 ) reference.tv_usec--;
- if (retard < -RATE_MON/8 ) reference.tv_usec++;
-			  for ( ; retard > 0; retard --) 
-			  {
-				 send (  pHost->skt,
-						 pHost->buf,
-						 pHost->buflen,
-						 0 );
-			     pHost->count --;
-			  }
-		     gettimeofday (& after100, NULL);
+		// now each 50 packets, we compare the effective rate to the target rate (pHost->us_delay_betw..)
+		// and adjust the operationnal rate (us_op_delay)
+		if (pHost->count % CALIBRATE_FREQ == 0)
+		{time_t us_late; 
+	     signed long pkts_late;
+		     if (before_calibration!=0)
+		     {
+				 us_late =    ( _microseconds() - before_calibration )       // time spent to send 50 packets
+							-  pHost->us_between_packets * CALIBRATE_FREQ ;  // target time to send 50 pkts
+				 pkts_late =  us_late / pHost->us_between_packets ;			 // number of packet late
+				 
+				 // correct the delay 
+				 if (pkts_late >  CALIBRATE_FREQ/4 )
+				 {
+				      us_op_delay--;		  // we are late, decrease delay
+				 	  before_calibration = 0; // and do not use this set for calibration
+                 }
+				 if (pkts_late < -CALIBRATE_FREQ/8 )
+				 {
+					  us_op_delay++;		// we are in advance, increase delay
+				 	  before_calibration = 0; // and do not use this set for calibration
+                 }
+				 // and send immediately the missing packets
+				 for ( ; pkts_late > 0; pkts_late --) 
+				  {
+					 send (  pHost->skt, pHost->buf, pHost->buflen, 0 );
+					 pHost->count --;
+				  }
+		     }
+		     before_calibration = _microseconds();	// for next calibration
 		 }
     }
-printf ("end with latency %d\n", reference.tv_usec);
+    LOG (INFO, "end with latency %d\n", us_op_delay);
+    
     close (pHost->skt);
     return NULL;
 } // UdpBulkSend
@@ -244,7 +273,7 @@ printf ("end with latency %d\n", reference.tv_usec);
 
 
 // --------------------------------------------------------
-// parse arguments
+// parsing arguments
 // --------------------------------------------------------
 
 // Add Host to the list (keep same order => add at the end of the list)
@@ -259,17 +288,14 @@ struct S_Host *pNewHost;
    pNewHost->name = name;
    pNewHost->dst_port = port;
    pNewHost->skt = -1;
-   // keep only count and set the delay                  
-   pNewHost->tv.tv_sec  = 1 / rate;
-   pNewHost->tv.tv_usec = (int) (1000000.0 / rate);
+   pNewHost->us_between_packets= (long) (1000000.0 / rate);
    pNewHost->count = count;
 
-
-   LOG (INFO, "#%d packets to send to host %s, port %s, (delay %d s/%d us, rate %d)\n", 
+   LOG (INFO, "#%d packets to send to host %s, port %s, (delay %d us, rate %d)\n", 
                pNewHost->count, pNewHost->name, pNewHost->dst_port, 
-               pNewHost->tv.tv_sec, pNewHost->tv.tv_usec, rate);
+               pNewHost->us_between_packets, rate);
 
-   // add the item at the end of the list
+   // add the record at the end of the list
    if (pHosts == NULL) pHosts = pNewHost;
    else
    {struct S_Host *pLast;
@@ -311,7 +337,9 @@ const double TERA_UNIT = 1024.0 * 1024.0 * 1024.0 * 1024.0;
       return (unsigned long) n;
 } // atoi_suffix
 
-
+// -------
+// parse arguments using getopt_long
+// -------
 int parse_arguments (int argc, char *argv[])
 {
 int flag;
@@ -352,7 +380,8 @@ int bandwidth=-1, pkt_count=-1, rate = -1, duration=-1;
               pkt_count = (duration==-1 ? sSettings.duration : duration) * rate;  // rate changed, not packet
    // trailing arguments --> Hosts
    while (optind < argc )
-      PushHost ( argv[optind++],                  sSettings.dst_port, 
+      PushHost ( argv[optind++],
+                 sSettings.dst_port, 
                  rate,
                  pkt_count );
   
@@ -388,7 +417,7 @@ void           *res;
    for (pHost=pHosts ; pHost!=NULL ; pHost = pHost->next)
        rc =   pthread_create (& pHost->thread_id, NULL, UdpBulkSend, pHost);
    if (rc) LOG(ERR, "can not create thread\n");
-sleep (5);
+
    // wait for all threads to terminate
     for (pHost=pHosts ; pHost!=NULL ; pHost = pHost->next)
         rc = pthread_join (pHost->thread_id, &res);
